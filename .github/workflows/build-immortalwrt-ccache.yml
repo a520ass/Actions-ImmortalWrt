@@ -1,0 +1,387 @@
+
+name: Build ImmortalWrt
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: 'SSH connection to Actions'
+        required: false
+        default: 'false'
+        options:
+          - false
+          - true
+      Cache:
+        type: choice
+        required: false
+        default: 使用缓存
+        options:
+          - 使用缓存
+          - 只读缓存
+          - 重新编译
+          - 不使用缓存
+      repo_url:
+        description: 'REPO URL'
+        required: true
+        default: 'https://github.com/immortalwrt/immortalwrt'
+      repo_branch:
+        description: 'REPO BRANCH'
+        required: true
+        default: 'master'
+      patch_version:
+        description: 'PATCH VERSION'
+        required: true
+        default: 'master-msm8916'
+      config_file:
+        description: 'CONFIG FILE'
+        required: true
+        default: 'msm8916.config'
+      p1_sh:
+        description: 'DIY P1 SH (OR PATCH SH)'
+        required: true
+        default: 'diy-patcham.sh'
+      p2_sh:
+        description: 'DIY P2 SH'
+        required: true
+        default: 'diy-part2.sh'
+      upload_bin:
+        description: 'upload build dir'
+        required: true
+        default: 'false'
+
+env:
+  REPO_URL: ${{ inputs.repo_url }}
+  REPO_BRANCH: ${{ inputs.repo_branch }}
+  PATCH_VERSION: ${{ inputs.patch_version }}
+  FEEDS_CONF: feeds.conf.default
+  CONFIG_FILE: ${{ inputs.config_file }}
+  DIY_P1_SH: ${{ inputs.p1_sh }}
+  DIY_P2_SH: ${{ inputs.p2_sh }}
+  UPLOAD_BIN_DIR: ${{ inputs.upload_bin }}
+  UPLOAD_FIRMWARE: true
+  UPLOAD_WSS: false
+  UPLOAD_RELEASE: true
+  TZ: Asia/Shanghai
+  # 使用缓存：恢复并保存；只读缓存：只恢复不上传；重新编译：从空缓存编译并保存；不使用缓存：全部关闭
+  # 定时或外部触发没有选项，按“使用缓存”处理
+  CACHE_MODE: ${{ inputs.Cache || '使用缓存' }}
+  # ccache 默认按编译器文件的修改时间判断编译器是否变化，工具链重新编译后会全部不命中，改为按版本判断
+  CCACHE_COMPILERCHECK: '%compiler% -dumpmachine; %compiler% -dumpversion'
+  CCACHE_MAXSIZE: 3G
+  
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@main
+
+      - name: Initialization environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          sudo -E apt-get -qq update
+          sudo -E apt-get -qq install build-essential ccache clang flex bison g++ gawk gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev python3-setuptools rsync swig unzip zlib1g-dev file wget patchutils android-sdk-libsparse-utils mkbootimg tree
+          sudo -E apt-get -qq autoremove --purge
+          sudo -E apt-get -qq clean
+          sudo timedatectl set-timezone "$TZ"
+          sudo mkdir -p /workdir
+          sudo chown $USER:$GROUPS /workdir
+          # todo fix mkbookimg
+          sudo rm -rf /usr/bin/mkbootimg
+          sudo wget https://dl.kstore.dev/download/5190/openwrt/mkbootimg -O /usr/bin/mkbootimg
+          sudo chmod +x /usr/bin/mkbootimg
+
+      - name: Clone source code
+        working-directory: /workdir
+        run: |
+          df -hT
+          git clone $REPO_URL -b $REPO_BRANCH openwrt
+          # tools 的 .prepared 标记文件名里带源码文件的修改时间，固定时间后缓存的工具链才能被识别
+          find openwrt/tools openwrt/toolchain -exec touch -h -d @1600000000 {} +
+          ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+
+      # 缓存在 clone 之后恢复，否则目录非空会导致 git clone 失败
+      # dl 与机型无关，共用一份，按前缀恢复最新的
+      - name: Restore download cache
+        id: dl-cache
+        if: env.CACHE_MODE != '不使用缓存'
+        uses: actions/cache/restore@v4
+        with:
+          path: /workdir/openwrt/dl
+          key: openwrt-dl-
+          restore-keys: |
+            openwrt-dl-
+      
+      - name: Restore compiler cache
+        if: env.CACHE_MODE == '使用缓存' || env.CACHE_MODE == '只读缓存'
+        uses: actions/cache/restore@v4
+        with:
+          path: /workdir/openwrt/.ccache
+          key: openwrt-ccache-an7581-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            openwrt-ccache-an7581-
+
+      - name: Load custom feeds
+        run: |
+          [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
+          [ -e build-files ] && mv build-files openwrt/build-files
+          chmod +x $DIY_P1_SH
+          cd openwrt
+          $GITHUB_WORKSPACE/$DIY_P1_SH ${{ env.PATCH_VERSION }}
+
+      - name: Update feeds
+        run: cd openwrt && ./scripts/feeds update -a
+
+      - name: Install feeds
+        run: cd openwrt && ./scripts/feeds install -a
+
+      - name: Load custom configuration
+        run: |
+          [ -e files ] && mv files openwrt/files
+          [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+          chmod +x $DIY_P2_SH
+          cd openwrt
+          $GITHUB_WORKSPACE/$DIY_P2_SH ${{ env.PATCH_VERSION }}
+          # 编译日志写到 logs/，失败时上传
+          sed -i '/^CONFIG_BUILD_LOG=/d; /^# CONFIG_BUILD_LOG is not set$/d' .config
+          echo 'CONFIG_BUILD_LOG=y' >> .config
+          if [ "$CACHE_MODE" != "不使用缓存" ]; then
+            sed -i '/^CONFIG_DEVEL=/d; /^# CONFIG_DEVEL is not set$/d; /^CONFIG_CCACHE=/d; /^# CONFIG_CCACHE is not set$/d' .config
+            printf 'CONFIG_DEVEL=y\nCONFIG_CCACHE=y\n' >> .config
+          fi
+
+      - name: SSH connection to Actions
+        uses: P3TERX/ssh2actions@v1.0.0
+        if: (github.event.inputs.ssh == 'true' && github.event.inputs.ssh  != 'false' && !cancelled()) || contains(github.event.action, 'ssh')
+        env:
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+
+      - name: Download package
+        id: package
+        run: |
+          cd openwrt
+          make defconfig
+          make download -j8
+          find dl -size -1024c -exec ls -l {} \;
+          find dl -size -1024c -exec rm -f {} \;
+          echo "dl_key=openwrt-dl-$(find dl -type f -printf '%P %s\n' | LC_ALL=C sort | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+      # key 按 dl 文件列表计算，没有新下载的文件时跳过上传
+      - name: Save download cache
+        if: (env.CACHE_MODE == '使用缓存' || env.CACHE_MODE == '重新编译') && steps.package.outputs.dl_key != steps.dl-cache.outputs.cache-matched-key
+        uses: actions/cache/save@v4
+        with:
+          path: /workdir/openwrt/dl
+          key: ${{ steps.package.outputs.dl_key }}
+
+
+      # 工具链缓存：key 由 tools / toolchain / include 等源码和工具链相关配置算出，只接受完全匹配，源码一变就重新编译
+      - name: Compute toolchain cache key
+        id: toolchain
+        if: env.CACHE_MODE != '不使用缓存'
+        run: |
+          cd openwrt
+          BOARD=$(sed -n 's/^CONFIG_TARGET_BOARD="\(.*\)"$/\1/p' .config)
+          SUBTARGET=$(sed -n 's/^CONFIG_TARGET_SUBTARGET="\(.*\)"$/\1/p' .config)
+          HASH=$({
+            git rev-parse HEAD:tools HEAD:toolchain HEAD:include HEAD:rules.mk "HEAD:target/linux/$BOARD/Makefile"
+            git rev-parse "HEAD:target/linux/$BOARD/$SUBTARGET/target.mk" 2>/dev/null || true
+            grep -E '^CONFIG_(ARCH|TARGET_ARCH_PACKAGES|CPU_TYPE|TARGET_OPTIMIZATION|EXTRA_OPTIMIZATION|SOFT_FLOAT|GCC_|BINUTILS_|LIBC|MUSL|GLIBC|TOOLCHAIN|EXTERNAL_TOOLCHAIN|USE_|CCACHE|DEVEL|INSTALL_|GDB|SSP_|BUILD_NLS)' .config
+          } | sha256sum | cut -c1-16)
+          echo "key=openwrt-toolchain-an7581-$HASH" >> "$GITHUB_OUTPUT"
+      
+      - name: Restore toolchain cache
+        id: toolchain-cache
+        if: env.CACHE_MODE == '使用缓存' || env.CACHE_MODE == '只读缓存'
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            /workdir/openwrt/staging_dir/host
+            /workdir/openwrt/staging_dir/toolchain-*
+            /workdir/openwrt/build_dir/host
+            /workdir/openwrt/build_dir/toolchain-*
+          key: ${{ steps.toolchain.outputs.key }}
+      
+      - name: Compile tools and toolchain
+        id: toolchain-build
+        env:
+          CACHE_HIT: ${{ steps.toolchain-cache.outputs.cache-hit }}
+        run: |
+          cd openwrt
+          # 恢复的文件统一刷新为当前时间，避免比本次新生成的 .config 等文件旧而触发重新编译
+          if [ "$CACHE_HIT" = "true" ]; then
+            find staging_dir/host staging_dir/toolchain-* build_dir/host build_dir/toolchain-* -exec touch -h -d "@$(date +%s)" {} +
+          fi
+          make -j$(nproc) tools/install toolchain/install || make -j1 V=s tools/install toolchain/install
+      
+      - name: Remove stale toolchain cache
+        if: steps.toolchain-build.outcome == 'success' && env.CACHE_MODE == '重新编译'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh cache delete "${{ steps.toolchain.outputs.key }}" || true
+      
+      # 工具链编译完立即保存，后面固件编译失败或取消也不影响
+      - name: Save toolchain cache
+        if: steps.toolchain-build.outcome == 'success' && (env.CACHE_MODE == '重新编译' || (env.CACHE_MODE == '使用缓存' && steps.toolchain-cache.outputs.cache-hit != 'true'))
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /workdir/openwrt/staging_dir/host
+            /workdir/openwrt/staging_dir/toolchain-*
+            /workdir/openwrt/build_dir/host
+            /workdir/openwrt/build_dir/toolchain-*
+          key: ${{ steps.toolchain.outputs.key }}
+
+      - name: Compile the firmware
+        id: compile
+        run: |
+          cd openwrt
+          echo -e "$(nproc) thread compile"
+          make -j$(nproc) || make -j1 || make -j1 V=s
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "DEVICE_NAME=_NEW" >> $GITHUB_ENV
+          echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+
+      - name: Check space usage and check bin
+        if: (!cancelled())
+        run: |
+          df -hT
+          cd openwrt
+          tree bin
+
+      - name: Show compiler cache statistics
+        if: always() && steps.toolchain-build.outcome != 'skipped' && env.CACHE_MODE != '不使用缓存'
+        run: |
+          [ -x openwrt/staging_dir/host/bin/ccache ] && CCACHE_DIR=/workdir/openwrt/.ccache openwrt/staging_dir/host/bin/ccache -s || true
+      
+      # 编译失败也保存，下次重试可以复用；编译步骤没运行时不保存，避免空缓存覆盖
+      - name: Save compiler cache
+        if: always() && steps.toolchain-build.outcome != 'skipped' && (env.CACHE_MODE == '使用缓存' || env.CACHE_MODE == '重新编译')
+        uses: actions/cache/save@v4
+        with:
+          path: /workdir/openwrt/.ccache
+          key: openwrt-ccache-an7581-${{ github.run_id }}-${{ github.run_attempt }}
+      
+      # 每类缓存只保留最新一份，避免超过仓库 10GB 上限后被自动淘汰
+      - name: Remove old caches
+        if: always() && (env.CACHE_MODE == '使用缓存' || env.CACHE_MODE == '重新编译')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          for PREFIX in openwrt-dl- openwrt-ccache-an7581- openwrt-toolchain-an7581-; do
+            gh cache list --key "$PREFIX" --sort created_at --order desc --limit 100 --json id --jq '.[1:][].id' |
+            while read -r ID; do
+              echo "deleting cache $ID ($PREFIX)"
+              gh cache delete "$ID"
+            done
+          done
+
+      - name: targz build dir
+        if: env.UPLOAD_BIN_DIR == 'true' && !cancelled()
+        run: |
+          cd openwrt
+          tar -czf bin.tar.gz bin
+          tar -czf dl.tar.gz dl
+          tar -czf feeds.tar.gz feeds
+          tar -czf build_dir.tar.gz build_dir
+          tar -czf staging_dir.tar.gz staging_dir
+
+      - name: Upload bin directory
+        uses: actions/upload-artifact@main
+        if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+        with:
+          name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+          path: openwrt/bin.tar.gz
+
+      - name: Upload dl directory
+        uses: actions/upload-artifact@main
+        if: env.UPLOAD_BIN_DIR == 'true' && !cancelled()
+        with:
+          name: OpenWrt_dl${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+          path: openwrt/dl.tar.gz
+
+      - name: Upload feeds directory
+        uses: actions/upload-artifact@main
+        if: env.UPLOAD_BIN_DIR == 'true' && !cancelled()
+        with:
+          name: OpenWrt_feeds${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+          path: openwrt/feeds.tar.gz
+
+      - name: Upload build_dir directory
+        uses: actions/upload-artifact@main
+        if: env.UPLOAD_BIN_DIR == 'true' && !cancelled()
+        with:
+          name: OpenWrt_build_dir${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+          path: openwrt/build_dir.tar.gz
+
+      - name: Upload staging_dir directory
+        uses: actions/upload-artifact@main
+        if: env.UPLOAD_BIN_DIR == 'true' && !cancelled()
+        with:
+          name: OpenWrt_staging_dir${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+          path: openwrt/staging_dir.tar.gz
+
+      - name: Organize files
+        id: organize
+        if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+        run: |
+          cd openwrt/bin/targets/*/*
+          tar -czf targets_packages.tar.gz packages
+          rm -rf packages
+          echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+          echo "status=success" >> $GITHUB_OUTPUT
+
+      - name: Upload firmware directory
+        uses: actions/upload-artifact@main
+        if: steps.organize.outputs.status == 'success' && !cancelled()
+        with:
+          name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+          path: ${{ env.FIRMWARE }}
+
+      - name: Upload firmware to Wenshushu
+        id: wenshushu
+        if: steps.organize.outputs.status == 'success' && env.UPLOAD_WSS == 'true' && !cancelled()
+        run: |
+          curl -fsSL git.io/file-transfer | sh
+          ./transfer wss -s -p 16 --no-progress ${FIRMWARE} 2>&1 | tee wenshushu.log
+          echo "::warning file=wenshushu.com::$(cat wenshushu.log | grep https)"
+          echo "::set-output name=url::$(cat wenshushu.log | grep Download | grep https | cut -f3 -d" ")"
+
+      - name: Generate release tag
+        id: tag
+        if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+        run: |
+          echo "::set-output name=release_tag::$(date +"%Y.%m.%d-%H%M")"
+          touch release.txt
+          [ $UPLOAD_WSS = true ] && echo "🔗 [Wenshushu](${{ steps.wenshushu.outputs.url }})" >> release.txt
+          echo "自定义构建参数" >> release.txt
+          echo "REPO_URL: $REPO_URL" >> release.txt
+          echo "REPO_BRANCH: $REPO_BRANCH" >> release.txt
+          echo "PATCH_VERSION: $PATCH_VERSION" >> release.txt
+          echo "FEEDS_CONF: $FEEDS_CONF" >> release.txt
+          echo "CONFIG_FILE: $CONFIG_FILE" >> release.txt
+          echo "DIY_P1_SH: $DIY_P1_SH" >> release.txt
+          echo "DIY_P2_SH: $DIY_P2_SH" >> release.txt
+          echo "status=success" >> $GITHUB_OUTPUT
+
+      - name: Upload firmware to release
+        uses: softprops/action-gh-release@v1
+        if: steps.tag.outputs.status == 'success' && !cancelled()
+        env:
+          GITHUB_TOKEN: ${{ secrets.MY_GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.tag.outputs.release_tag }}
+          body_path: release.txt
+          files: ${{ env.FIRMWARE }}/*
