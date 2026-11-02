@@ -274,7 +274,7 @@ jobs:
         run: |
           tag="build-${GITHUB_SHA}"
           date_str="$(date -u +%Y-%m-%d)"
-          title="OpenWrt build: ${date_str}"
+          title="ImmortalWrt build: ${date_str}"
           notes="Automated release for commit ${GITHUB_SHA} on ${GITHUB_REF_NAME}"
 
           gh release create "$tag" \
