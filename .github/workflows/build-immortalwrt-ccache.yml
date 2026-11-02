@@ -1,5 +1,5 @@
 
-name: Build ImmortalWrt
+name: Build ImmortalWrt Cache
 
 on:
   repository_dispatch:
